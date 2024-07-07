@@ -5,16 +5,16 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"github.com/go-webauthn/webauthn/webauthn"
+	"github.com/gobwas/glob"
+	"github.com/joho/godotenv"
+	"github.com/kelseyhightower/envconfig"
 	"net/url"
 	"os"
 	"regexp"
 	"strings"
 	"text/template"
 	"time"
-
-	"github.com/gobwas/glob"
-	"github.com/joho/godotenv"
-	"github.com/kelseyhightower/envconfig"
 )
 
 const defaultMinPasswordLength int = 6
@@ -102,14 +102,46 @@ type JWTConfiguration struct {
 	KeyID            string   `json:"key_id" split_words:"true"`
 }
 
+type WebauthnConfiguration struct {
+	Enabled bool `default:"false"`
+	// TODO: Come up with more sensible defaults for these
+	RPDisplayName string   `json:"rp_display_name" split_words:"true" default:"Go Webauthn"`
+	RPID          string   `json:"rp_id"`
+	RPOrigins     []string `json:"rp_origins" split_words:"true"`
+	// TODO: Parse and set this from config
+	Webauthn *webauthn.WebAuthn `json:"overall_configuration" split_words:"true"`
+}
+
+func (w *WebauthnConfiguration) PopulateWebauthnConfiguration() error {
+	// TODO: Decide whether to remove since there's already vlaidation in .New at library level
+	if w.RPDisplayName == "" || w.RPID == "" || len(w.RPOrigins) == 0 {
+		return fmt.Errorf("display name, ID, and origins need to be populated")
+	}
+	wconfig := &webauthn.Config{
+		RPDisplayName: w.RPDisplayName,
+		RPID:          w.RPID,
+		RPOrigins:     w.RPOrigins,
+	}
+	var (
+		webAuthn *webauthn.WebAuthn
+		err      error
+	)
+	if webAuthn, err = webauthn.New(wconfig); err != nil {
+		return fmt.Errorf("invalid webauthn configuration: %v", err)
+	}
+	w.Webauthn = webAuthn
+	return nil
+}
+
 // MFAConfiguration holds all the MFA related Configuration
 type MFAConfiguration struct {
-	Enabled                     bool          `default:"false"`
-	ChallengeExpiryDuration     float64       `json:"challenge_expiry_duration" default:"300" split_words:"true"`
-	FactorExpiryDuration        time.Duration `json:"factor_expiry_duration" default:"300s" split_words:"true"`
-	RateLimitChallengeAndVerify float64       `split_words:"true" default:"15"`
-	MaxEnrolledFactors          float64       `split_words:"true" default:"10"`
-	MaxVerifiedFactors          int           `split_words:"true" default:"10"`
+	Enabled                     bool                  `default:"false"`
+	ChallengeExpiryDuration     float64               `json:"challenge_expiry_duration" default:"300" split_words:"true"`
+	FactorExpiryDuration        time.Duration         `json:"factor_expiry_duration" default:"300s" split_words:"true"`
+	RateLimitChallengeAndVerify float64               `split_words:"true" default:"15"`
+	MaxEnrolledFactors          float64               `split_words:"true" default:"10"`
+	MaxVerifiedFactors          int                   `split_words:"true" default:"10"`
+	Webauthn                    WebauthnConfiguration `json:"webauthn" split_words:"true"`
 }
 
 type APIConfiguration struct {
@@ -640,6 +672,12 @@ func LoadGlobal(filename string) (*GlobalConfiguration, error) {
 
 	if err := config.Validate(); err != nil {
 		return nil, err
+	}
+
+	if config.MFA.Enabled && config.MFA.Webauthn.Enabled {
+		if err := config.MFA.Webauthn.PopulateWebauthnConfiguration(); err != nil {
+			return nil, err
+		}
 	}
 
 	if config.Hook.PasswordVerificationAttempt.Enabled {

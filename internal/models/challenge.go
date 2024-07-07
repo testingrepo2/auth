@@ -2,6 +2,8 @@ package models
 
 import (
 	"database/sql"
+	"github.com/go-webauthn/webauthn/protocol"
+	"github.com/go-webauthn/webauthn/webauthn"
 	"github.com/gofrs/uuid"
 	"github.com/pkg/errors"
 	"github.com/supabase/auth/internal/storage"
@@ -9,12 +11,14 @@ import (
 )
 
 type Challenge struct {
-	ID         uuid.UUID  `json:"challenge_id" db:"id"`
-	FactorID   uuid.UUID  `json:"factor_id" db:"factor_id"`
-	CreatedAt  time.Time  `json:"created_at" db:"created_at"`
-	VerifiedAt *time.Time `json:"verified_at,omitempty" db:"verified_at"`
-	IPAddress  string     `json:"ip_address" db:"ip_address"`
-	Factor     *Factor    `json:"factor,omitempty" belongs_to:"factor"`
+	ID                uuid.UUID  `json:"challenge_id" db:"id"`
+	FactorID          uuid.UUID  `json:"factor_id" db:"factor_id"`
+	CreatedAt         time.Time  `json:"created_at" db:"created_at"`
+	VerifiedAt        *time.Time `json:"verified_at,omitempty" db:"verified_at"`
+	IPAddress         string     `json:"ip_address" db:"ip_address"`
+	Factor            *Factor    `json:"factor,omitempty" belongs_to:"factor"`
+	WebauthnChallenge *string    `json:"webauthn_challenge,omitempty" db:"webauthn_challenge"`
+	UserVerification  *string    `json:"user_verification,omitempty" db:"user_verification"`
 }
 
 func (Challenge) TableName() string {
@@ -29,6 +33,21 @@ func NewChallenge(factor *Factor, ipAddress string) *Challenge {
 		ID:        id,
 		FactorID:  factor.ID,
 		IPAddress: ipAddress,
+	}
+	return challenge
+}
+
+func NewWebauthnChallenge(factor *Factor, ipAddress string, webauthnChallenge string) *Challenge {
+	id := uuid.Must(uuid.NewV4())
+	defaultVerification := "prefeerred"
+
+	challenge := &Challenge{
+		ID:                id,
+		FactorID:          factor.ID,
+		IPAddress:         ipAddress,
+		WebauthnChallenge: &webauthnChallenge,
+		//TODO: Have a more sane default
+		UserVerification: &defaultVerification,
 	}
 	return challenge
 }
@@ -57,4 +76,30 @@ func (c *Challenge) HasExpired(expiryDuration float64) bool {
 
 func (c *Challenge) GetExpiryTime(expiryDuration float64) time.Time {
 	return c.CreatedAt.Add(time.Second * time.Duration(expiryDuration))
+}
+
+func (c *Challenge) ToSession(userID uuid.UUID, challengeExpiryDuration float64) webauthn.SessionData {
+	return webauthn.SessionData{
+		Challenge:        *c.WebauthnChallenge,
+		UserID:           []byte(userID.String()),
+		Expires:          c.GetExpiryTime(challengeExpiryDuration),
+		UserVerification: protocol.UserVerificationRequirement(*c.UserVerification),
+	}
+}
+
+type WebauthnSession struct {
+	*webauthn.SessionData
+}
+
+func (ws *WebauthnSession) ToChallenge(factorID uuid.UUID, ipAddress string) *Challenge {
+	id := uuid.Must(uuid.NewV4())
+	defaultVerification := "preferred"
+	return &Challenge{
+		ID:                id,
+		FactorID:          factorID,
+		IPAddress:         ipAddress,
+		UserVerification:  &defaultVerification,
+		WebauthnChallenge: &ws.Challenge,
+	}
+
 }

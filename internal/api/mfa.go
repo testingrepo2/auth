@@ -10,6 +10,7 @@ import (
 	"github.com/aaronarduino/goqrsvg"
 	svg "github.com/ajstarks/svgo"
 	"github.com/boombuler/barcode/qr"
+	"github.com/go-webauthn/webauthn/protocol"
 	"github.com/gofrs/uuid"
 	"github.com/pquerna/otp"
 	"github.com/pquerna/otp/totp"
@@ -42,6 +43,11 @@ type EnrollFactorResponse struct {
 	TOTP         TOTPObject `json:"totp,omitempty"`
 }
 
+type WebauthnRegisterStartResponse struct {
+	PublicKeyCredentialRequestOptions *protocol.CredentialCreation `json:"public_key_credential_request_options"`
+	FactorID                          uuid.UUID                    `json:"factor_id"`
+}
+
 type VerifyFactorParams struct {
 	ChallengeID uuid.UUID `json:"challenge_id"`
 	Code        string    `json:"code"`
@@ -52,6 +58,11 @@ type ChallengeFactorResponse struct {
 	ExpiresAt int64     `json:"expires_at"`
 }
 
+type WebauthnLoginStartResponse struct {
+	PublicKeyCredentialRequestOptions *protocol.CredentialAssertion `json:"public_key_credential_request_options"`
+	// TBD
+}
+
 type UnenrollFactorResponse struct {
 	ID uuid.UUID `json:"id"`
 }
@@ -60,6 +71,82 @@ const (
 	InvalidFactorOwnerErrorMessage = "Factor does not belong to user"
 	QRCodeGenerationErrorMessage   = "Error generating QR Code"
 )
+
+func (a *API) handleWebauthnEnrollment(w http.ResponseWriter, r *http.Request, params *EnrollFactorParams) error {
+	// TODO: re-use stuff
+	// TODO: Check for unique friendly name
+	ctx := r.Context()
+	user := getUser(ctx)
+	config := a.config
+	db := a.db.WithContext(ctx)
+	ipAddress := utilities.GetIPAddress(r)
+
+	webAuthn := config.MFA.Webauthn.Webauthn
+	// TODO: Figure out what to do with session data
+	options, session, err := webAuthn.BeginRegistration(user)
+	if err != nil {
+		// TODO: return a proper error
+		return internalServerError("internal server error")
+	}
+	ws := &models.WebauthnSession{
+		SessionData: session,
+	}
+	factor := models.NewFactor(user, params.FriendlyName, models.Webauthn, models.FactorStateUnverified)
+	challenge := ws.ToChallenge(factor.ID, ipAddress)
+	err = db.Transaction(func(tx *storage.Connection) error {
+		if terr := tx.Create(factor); err != nil {
+			return terr
+		}
+		if terr := tx.Create(challenge); terr != nil {
+			return terr
+		}
+		return nil
+
+	})
+	if err != nil {
+		return err
+	}
+
+	return sendJSON(w, http.StatusOK, &WebauthnRegisterStartResponse{
+		PublicKeyCredentialRequestOptions: options,
+		FactorID:                          factor.ID,
+		// TODO: move the challenge creation logic to "Challenge"
+	})
+
+}
+
+func (a *API) handleWebauthnVerification(w http.ResponseWriter, r *http.Request, params *VerifyFactorParams) error {
+	// TODO: don't reuse this
+	ctx := r.Context()
+	user := getUser(ctx)
+	config := a.config
+	factor := getFactor(ctx)
+	webAuthn := config.MFA.Webauthn.Webauthn
+	// db := a.db.WithContext(ctx)
+	challenge, err := models.FindChallengeByID(a.db, params.ChallengeID)
+	if err != nil {
+		return err
+	}
+	sessionData := challenge.ToSession(user.ID, config.MFA.ChallengeExpiryDuration)
+
+	// TODO: Decide based on the factor state whether this is a registration or login
+	if factor.Status == models.FactorStateUnverified.String() {
+		_, err := webAuthn.FinishRegistration(user, sessionData, r)
+		if err != nil {
+			return err
+		}
+		// TODO: Do verify the credential
+		return badRequestError(ErrorCodeValidationFailed, "registration here")
+	}
+
+	// Login case where factor is verified
+	_, err = webAuthn.FinishLogin(user, sessionData, r)
+	if err != nil {
+		return internalServerError("login borked")
+	}
+
+	return badRequestError(ErrorCodeValidationFailed, "unknown error")
+}
 
 func (a *API) EnrollFactor(w http.ResponseWriter, r *http.Request) error {
 	ctx := r.Context()
@@ -76,9 +163,14 @@ func (a *API) EnrollFactor(w http.ResponseWriter, r *http.Request) error {
 	if err := retrieveRequestParams(r, params); err != nil {
 		return err
 	}
+	switch params.FactorType {
+	case models.Webauthn:
+		return a.handleWebauthnEnrollment(w, r, params)
+	case models.TOTP:
+	// No return statement, continue execution with the rest of the function
 
-	if params.FactorType != models.TOTP {
-		return badRequestError(ErrorCodeValidationFailed, "factor_type needs to be totp")
+	default:
+		return badRequestError(ErrorCodeValidationFailed, "factor_type needs to be totp or webauthn")
 	}
 
 	issuer := ""
@@ -182,7 +274,27 @@ func (a *API) ChallengeFactor(w http.ResponseWriter, r *http.Request) error {
 	user := getUser(ctx)
 	factor := getFactor(ctx)
 	ipAddress := utilities.GetIPAddress(r)
-	challenge := models.NewChallenge(factor, ipAddress)
+	// TODO: Check if webauthn factor, do separate branch for login
+	var challenge *models.Challenge
+	if factor.FactorType == models.Webauthn {
+		// Maybe vary behaviour based on whether it is registration or login flow
+		webAuthn := a.config.MFA.Webauthn.Webauthn
+		// if factor is not verified or it is not a webauthn factor then return
+		options, session, err := webAuthn.BeginLogin(user)
+		if err != nil {
+			return err
+		}
+		ws := &models.WebauthnSession{
+			SessionData: session,
+		}
+		challenge = ws.ToChallenge(factor.ID, ipAddress)
+
+		return sendJSON(w, http.StatusOK, &WebauthnLoginStartResponse{
+			PublicKeyCredentialRequestOptions: options,
+		})
+	} else {
+		challenge = models.NewChallenge(factor, ipAddress)
+	}
 
 	if err := db.Transaction(func(tx *storage.Connection) error {
 		if terr := tx.Create(challenge); terr != nil {
@@ -221,6 +333,10 @@ func (a *API) VerifyFactor(w http.ResponseWriter, r *http.Request) error {
 
 	if !factor.IsOwnedBy(user) {
 		return internalServerError(InvalidFactorOwnerErrorMessage)
+	}
+	// Branch off for webauthn type factors.
+	if factor.FactorType == models.Webauthn {
+		return a.handleWebauthnVerification(w, r, params)
 	}
 
 	challenge, err := models.FindChallengeByID(db, params.ChallengeID)

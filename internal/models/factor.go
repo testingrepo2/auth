@@ -31,6 +31,7 @@ func (factorState FactorState) String() string {
 }
 
 const TOTP = "totp"
+const Webauthn = "webauthn"
 
 type AuthenticationMethod int
 
